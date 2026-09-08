@@ -1,0 +1,150 @@
+# Release pipeline: every push to main builds the plugin and — unless tag
+# v<version> already exists (rebase + force-push of an already published
+# version) — creates a GitHub Release and uploads the package to Thunderstore.
+#
+# The version is read from thunderstore/manifest.json and must agree with the
+# other two version sources (<Version> in the csproj and PLUGIN_VERSION in
+# PluginInfo.cs); the pipeline refuses to run on a placeholder (0.0.0/dev).
+# Release notes are extracted from CHANGELOG.md (one `## <version>` section).
+#
+# One-time setup:
+#   1. Run scripts/make-refs.sh and upload dist/refs.zip to the "game-refs"
+#      release (see the header of that script) — CI needs it to build.
+#   2. Add the repo secret THUNDERSTORE_TOKEN (from thunderstore.io settings).
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Serialize releases: a push queued behind a running one still gets its own
+# run, so two quick pushes can't race on tag creation.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  TS_NAMESPACE: XiaoHuiHui233
+  TS_COMMUNITY: human-fall-flat # https://thunderstore.io/c/human-fall-flat/
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TCLI_AUTH_TOKEN: ${{ secrets.THUNDERSTORE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve & verify version
+        id: ver
+        run: |
+          set -euo pipefail
+          VERSION="$(jq -r .version_number thunderstore/manifest.json)"
+          CSPROJ="$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' src/MyAwesomeWhitelist/MyAwesomeWhitelist.csproj | head -n1 | tr -d '[:space:]')"
+          PLUGIN="$(sed -n 's/.*PLUGIN_VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' src/MyAwesomeWhitelist/PluginInfo.cs | head -n1 | tr -d '[:space:]')"
+
+          # All three version sources must agree before anything is released.
+          if [[ "$VERSION" != "$CSPROJ" || "$VERSION" != "$PLUGIN" ]]; then
+            echo "::error::Version mismatch: manifest=$VERSION csproj=$CSPROJ PluginInfo=$PLUGIN"
+            exit 1
+          fi
+          # A non-release placeholder must never ship from main.
+          if [[ "$VERSION" == "0.0.0" || "$VERSION" == "dev" ]]; then
+            echo "::error::Refusing to release placeholder version '$VERSION'"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Already published? (same-version re-push / force-push)
+        id: check
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          if [[ -n "$(git ls-remote origin "refs/tags/v$VERSION")" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::tag v$VERSION already exists — building only. Bump the version to publish again."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Fetch BepInEx core DLLs (version pinned by the manifest dependency)
+        run: |
+          dep=$(jq -r '.dependencies[] | select(startswith("BepInEx-BepInExPack-"))' thunderstore/manifest.json)
+          IFS=- read -r owner name ver <<< "$dep"
+          curl -fL -o bepinexpack.zip "https://thunderstore.io/package/download/$owner/$name/$ver/"
+          mkdir -p deps/bepinex && unzip -q bepinexpack.zip -d deps/bepinex
+          # Resolve to an absolute path: MSBuild resolves relative <HintPath>
+          # against the csproj directory, so a relative BEPINEX_CORE would miss.
+          echo "BEPINEX_CORE=$(realpath "$(dirname "$(find deps/bepinex -name BepInEx.dll -print -quit)")")" >> "$GITHUB_ENV"
+
+      - name: Fetch game reference DLLs (from the "game-refs" release)
+        run: |
+          mkdir -p deps/managed
+          gh release download game-refs --repo "$GITHUB_REPOSITORY" --pattern 'refs.zip' --dir deps
+          unzip -q deps/refs.zip -d deps/managed
+          echo "GAME_MANAGED=$PWD/deps/managed" >> "$GITHUB_ENV"
+
+      - name: Build & pack
+        run: scripts/pack.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyAwesomeWhitelist-${{ steps.ver.outputs.version }}
+          path: dist/*.zip
+
+      - name: Extract release notes from CHANGELOG
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          awk -v ver="## $VERSION" '
+            $0 == ver { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [[ ! -s release-notes.md ]]; then
+            echo "::error::No CHANGELOG entry found for version $VERSION"
+            exit 1
+          fi
+          echo "Extracted release notes from CHANGELOG.md for $VERSION"
+
+      - name: Create GitHub release
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          gh release create "v$VERSION" "dist/MyAwesomeWhitelist-$VERSION.zip" \
+            --title "MyAwesomeWhitelist v$VERSION" --notes-file release-notes.md
+
+      - name: Publish to Thunderstore
+        if: steps.check.outputs.skip != 'true' && env.TS_COMMUNITY != '' && env.TCLI_AUTH_TOKEN != ''
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          DESC="$(python3 -c "import json;print(json.load(open('thunderstore/manifest.json'))['description'])")"
+          # tcli 0.2.x reads the namespace from [package], not [project] — a
+          # mismatched header silently falls back to the placeholder "AuthorName".
+          cat > thunderstore.toml <<EOF
+          [config]
+          schemaVersion = "0.0.1"
+
+          [package]
+          namespace = "${{ env.TS_NAMESPACE }}"
+          name = "MyAwesomeWhitelist"
+          versionNumber = "$VERSION"
+          description = "$DESC"
+          websiteUrl = "https://github.com/${{ github.repository }}"
+
+          [publish]
+          repository = "https://thunderstore.io"
+          communities = ["${{ env.TS_COMMUNITY }}"]
+          EOF
+          dotnet tool install -g tcli
+          tcli publish --config-path thunderstore.toml --file "dist/MyAwesomeWhitelist-$VERSION.zip" --token "$TCLI_AUTH_TOKEN"

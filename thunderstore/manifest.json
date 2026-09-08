@@ -1,0 +1,9 @@
+{
+  "name": "MyAwesomeWhitelist",
+  "version_number": "0.1.0",
+  "website_url": "https://github.com/guojianglong/MyAwesomeWhitelist",
+  "description": "Host-side whitelist/blacklist manager with an in-game IMGUI window: force-kick players (unblockable by client anti-kick mods), permanent + per-lobby temporary lists, join refusal at the Steam P2P layer. Hotkey configurable (default Ctrl+Shift+W).",
+  "dependencies": [
+    "BepInEx-BepInExPack-5.4.2100"
+  ]
+}
